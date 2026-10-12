@@ -1931,6 +1931,187 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  // setProxy used to read proxy.auth / username / password / hostname / host /
+  // port / protocol through the prototype chain, so a polluted Object.prototype
+  // could inject attacker-controlled Proxy-Authorization credentials or point the
+  // proxied request at an attacker-controlled host.
+  describe('setProxy prototype pollution guards', () => {
+    const pollutedKeys = ['auth', 'username', 'password', 'hostname', 'host', 'port', 'protocol'];
+    const proxyEnvKeys = [
+      'http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY',
+      'no_proxy', 'NO_PROXY', 'npm_config_http_proxy', 'npm_config_https_proxy', 'npm_config_proxy',
+      'npm_config_no_proxy'
+    ];
+
+    const clearPollution = () => {
+      pollutedKeys.forEach((key) => {
+        delete Object.prototype[key];
+      });
+    };
+
+    // Mirror the null-prototype request options built by the http adapter.
+    const makeOptions = () => Object.assign(Object.create(null), {
+      headers: Object.create(null),
+      beforeRedirects: Object.create(null),
+      hostname: 'victim.example.com',
+      port: 80,
+      protocol: 'http:'
+    });
+
+    // Pollute Object.prototype only for the duration of fn so Node and mocha
+    // internals never observe the injected keys.
+    const withPollution = (values, fn) => {
+      Object.keys(values).forEach((key) => {
+        Object.prototype[key] = values[key];
+      });
+
+      try {
+        fn();
+      } finally {
+        clearPollution();
+      }
+    };
+
+    const withProxyEnv = (values, fn) => {
+      const savedEnv = {};
+
+      proxyEnvKeys.forEach((key) => {
+        savedEnv[key] = process.env[key];
+        delete process.env[key];
+      });
+      Object.keys(values).forEach((key) => {
+        process.env[key] = values[key];
+      });
+
+      try {
+        fn();
+      } finally {
+        proxyEnvKeys.forEach((key) => {
+          if (savedEnv[key] === undefined) {
+            delete process.env[key];
+          } else {
+            process.env[key] = savedEnv[key];
+          }
+        });
+      }
+    };
+
+    afterEach(clearPollution);
+
+    it('ignores a polluted Object.prototype.auth for a plain-object proxy config', () => {
+      const options = makeOptions();
+
+      withPollution({auth: {username: 'attacker', password: 'exfil'}}, () => {
+        __setProxy(options, {host: '127.0.0.1', port: 8030}, 'http://victim.example.com/start');
+      });
+
+      assert.strictEqual(options.hostname, '127.0.0.1', 'precondition: request must be proxied');
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        undefined,
+        'polluted Object.prototype.auth must not produce a Proxy-Authorization header'
+      );
+    });
+
+    it('ignores a polluted Object.prototype.auth for an environment-derived proxy URL', () => {
+      const options = makeOptions();
+
+      withProxyEnv({http_proxy: 'http://127.0.0.1:8030'}, () => {
+        withPollution({auth: {username: 'attacker', password: 'exfil'}}, () => {
+          __setProxy(options, undefined, 'http://victim.example.com/start');
+        });
+      });
+
+      assert.strictEqual(options.hostname, '127.0.0.1', 'precondition: request must be proxied');
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        undefined,
+        'URL proxies have no own auth field, so a polluted Object.prototype.auth must be ignored'
+      );
+    });
+
+    it('ignores polluted Object.prototype.username and password for a plain-object proxy config', () => {
+      const options = makeOptions();
+
+      withPollution({username: 'attacker', password: 'exfil'}, () => {
+        __setProxy(options, {host: '127.0.0.1', port: 8030}, 'http://victim.example.com/start');
+      });
+
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        undefined,
+        'polluted Object.prototype.username must not produce a Proxy-Authorization header'
+      );
+    });
+
+    it('ignores a polluted password when the own proxy auth object only sets a username', () => {
+      const options = makeOptions();
+
+      withPollution({password: 'exfil'}, () => {
+        __setProxy(
+          options,
+          {host: '127.0.0.1', port: 8030, auth: {username: 'user'}},
+          'http://victim.example.com/start'
+        );
+      });
+
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        'Basic ' + Buffer.from('user:', 'utf8').toString('base64')
+      );
+    });
+
+    it('ignores polluted Object.prototype.hostname and protocol for a plain-object proxy config', () => {
+      const options = makeOptions();
+
+      withPollution({hostname: 'attacker.example.com', protocol: 'https'}, () => {
+        __setProxy(options, {host: '127.0.0.1', port: 8030}, 'http://victim.example.com/start');
+      });
+
+      assert.strictEqual(options.hostname, '127.0.0.1');
+      assert.strictEqual(options.host, '127.0.0.1');
+      assert.strictEqual(options.port, 8030);
+      assert.strictEqual(options.protocol, 'http:');
+      assert.strictEqual(options.headers.host, 'victim.example.com:80');
+    });
+
+    it('ignores a polluted Object.prototype.port for a plain-object proxy config', () => {
+      const options = makeOptions();
+
+      withPollution({port: 31337, host: 'attacker.example.com'}, () => {
+        __setProxy(options, {hostname: '127.0.0.1', protocol: 'http'}, 'http://victim.example.com/start');
+      });
+
+      assert.strictEqual(options.hostname, '127.0.0.1');
+      assert.strictEqual(options.port, undefined);
+    });
+
+    it('still honors own proxy credentials without mutating the proxy config', () => {
+      const options = makeOptions();
+      const proxyConfig = {host: '127.0.0.1', port: 8030, username: 'user', password: 'pass'};
+
+      __setProxy(options, proxyConfig, 'http://victim.example.com/start');
+
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64')
+      );
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(proxyConfig, 'auth'), false);
+    });
+
+    it('does not proxy an IPv4-mapped IPv6 request whose IPv4 form is listed in no_proxy', () => {
+      const options = makeOptions();
+      options.hostname = '::ffff:a9fe:a9fe';
+
+      withProxyEnv({http_proxy: 'http://127.0.0.1:8030', no_proxy: '169.254.169.254'}, () => {
+        __setProxy(options, undefined, 'http://[::ffff:a9fe:a9fe]/latest/meta-data/');
+      });
+
+      assert.strictEqual(options.hostname, '::ffff:a9fe:a9fe', 'request must go direct, not via the proxy');
+      assert.strictEqual(options.headers['Proxy-Authorization'], undefined);
+    });
+  });
+
   it('should support cancel', function (done) {
     var source = axios.CancelToken.source();
     server = http.createServer(function (req, res) {

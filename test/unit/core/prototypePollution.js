@@ -2198,3 +2198,493 @@ describe("CVE-2026-44495 mergeConfig and http adapter own-property reads", funct
     });
   });
 });
+
+// CVE-2026-44490: a polluted Object.prototype could
+//  - turn the data descriptors axios hands to Object.defineProperty into invalid
+//    accessor descriptors (Object.prototype.get / set), breaking axios entirely;
+//  - surface through utils.merge's read of the existing value (result[key]);
+//  - inject header buckets (Object.prototype.common / Object.prototype.<method>)
+//    into the flattened request headers;
+//  - inject Proxy-Authorization credentials or redirect the proxied request via
+//    setProxy's prototype-chain reads of auth / username / password / hostname.
+describe("CVE-2026-44490 descriptor, merge, header bucket and proxy gadgets", function () {
+  const pollutedKeys = [
+    "get",
+    "set",
+    "headers",
+    "customNested",
+    "common",
+    "options",
+    "auth",
+    "username",
+    "password",
+    "hostname",
+    "host",
+    "port",
+    "protocol",
+  ];
+
+  function cleanup() {
+    pollutedKeys.forEach(function (key) {
+      delete Object.prototype[key];
+    });
+  }
+
+  // Pollute Object.prototype only while fn runs synchronously, and always clear
+  // it before control returns to mocha. The outcome (result or thrown error) is
+  // returned so assertions run against a clean prototype.
+  function withPollution(values, fn) {
+    Object.keys(values).forEach(function (key) {
+      Object.prototype[key] = values[key];
+    });
+
+    try {
+      return { result: fn() };
+    } catch (err) {
+      return { error: err };
+    } finally {
+      cleanup();
+    }
+  }
+
+  function okResponse(config) {
+    return Promise.resolve({
+      data: null,
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config: config,
+      request: {},
+    });
+  }
+
+  afterEach(cleanup);
+
+  // Object.defineProperty performs HasProperty/Get for `get` and `set` on the
+  // descriptor. A plain-literal descriptor inherits a polluted
+  // Object.prototype.get / set and is rejected with a TypeError.
+  describe("Object.defineProperty descriptor literals", function () {
+    it("should define AxiosHeaders accessors when Object.prototype.get is polluted", function () {
+      const outcome = withPollution({ get: "attacker" }, function () {
+        AxiosHeaders.accessor("X-Pp-Get-Test");
+      });
+
+      assert.ifError(outcome.error);
+
+      const headers = new AxiosHeaders();
+      headers.setXPpGetTest("value");
+      assert.strictEqual(headers.getXPpGetTest(), "value");
+      assert.strictEqual(headers.hasXPpGetTest(), true);
+    });
+
+    it("should define AxiosHeaders accessors when Object.prototype.set is polluted", function () {
+      const outcome = withPollution({ set: "attacker" }, function () {
+        AxiosHeaders.accessor("X-Pp-Set-Test");
+      });
+
+      assert.ifError(outcome.error);
+
+      const headers = new AxiosHeaders();
+      headers.setXPpSetTest("value");
+      assert.strictEqual(headers.getXPpSetTest(), "value");
+    });
+
+    it("should not throw in mergeConfig when Object.prototype.get is polluted", function () {
+      const outcome = withPollution({ get: "attacker" }, function () {
+        return mergeConfig({}, { url: "/x", method: "get" });
+      });
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(outcome.result.url, "/x");
+      assert.strictEqual(outcome.result.method, "get");
+      assert.strictEqual(typeof outcome.result.hasOwnProperty, "function");
+    });
+
+    it("should not throw in mergeConfig when Object.prototype get and set are polluted functions", function () {
+      const outcome = withPollution(
+        { get: function () {}, set: function () {} },
+        function () {
+          return mergeConfig(
+            {},
+            {
+              url: "/users",
+              headers: {
+                common: {
+                  Accept: "application/json",
+                },
+              },
+            },
+          );
+        },
+      );
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(outcome.result.url, "/users");
+      assert.strictEqual(outcome.result.headers.common.Accept, "application/json");
+    });
+
+    it("should not throw in utils.extend when Object.prototype.get is polluted", function () {
+      const a = {};
+      const b = {
+        x: 1,
+        fn: function () {},
+      };
+
+      const outcome = withPollution({ get: "attacker" }, function () {
+        utils.extend(a, b);
+      });
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(a.x, 1);
+      assert.strictEqual(typeof a.fn, "function");
+    });
+
+    it("should not throw in utils.extend with thisArg when Object.prototype.get is polluted", function () {
+      const a = {};
+      const ctx = { tag: "ctx" };
+      const b = {
+        method: function () {
+          return this.tag;
+        },
+      };
+
+      const outcome = withPollution({ get: "attacker" }, function () {
+        utils.extend(a, b, ctx);
+      });
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(a.method(), "ctx");
+    });
+
+    it("should not throw in utils.inherits when Object.prototype.get is polluted", function () {
+      function Parent() {}
+      function Child() {}
+
+      const outcome = withPollution({ get: "attacker" }, function () {
+        utils.inherits(Child, Parent);
+      });
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(Child.prototype.constructor, Child);
+      assert.strictEqual(Child.super, Parent.prototype);
+    });
+
+    it("should create an instance and dispatch a request when Object.prototype get and set are polluted", async function () {
+      let seenHeaders;
+      let request;
+
+      const outcome = withPollution(
+        { get: function () {}, set: function () {} },
+        function () {
+          const instance = axios.create({
+            adapter: function (config) {
+              // The adapter runs synchronously inside the polluted window, so
+              // every descriptor site up to dispatch has been exercised by now.
+              cleanup();
+              seenHeaders = config.headers;
+              return okResponse(config);
+            },
+            headers: {
+              common: {
+                Accept: "application/json",
+              },
+            },
+          });
+
+          request = instance.get("http://stub.invalid/users");
+        },
+      );
+
+      assert.ifError(outcome.error);
+      await request;
+      assert.ok(seenHeaders, "adapter was not invoked");
+      assert.strictEqual(seenHeaders.get("Accept"), "application/json");
+    });
+  });
+
+  // utils.merge previously read `result[targetKey]` directly, which walks the
+  // prototype chain. A polluted Object.prototype.<key> object would surface as
+  // the existing value and be merged into the result.
+  describe("utils.merge prototype-chain read", function () {
+    it("should not pick up polluted Object.prototype.<key> as the existing value", function () {
+      const outcome = withPollution({ headers: { evil: "yes" } }, function () {
+        return utils.merge({}, { headers: { "Content-Type": "application/json" } });
+      });
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(outcome.result.headers["Content-Type"], "application/json");
+      assert.strictEqual(outcome.result.headers.evil, undefined);
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(outcome.result.headers, "evil"),
+        false,
+      );
+    });
+
+    it("should not absorb polluted nested objects when the key is absent from inputs", function () {
+      const outcome = withPollution({ customNested: { evil: "yes" } }, function () {
+        return utils.merge({}, { safe: "value" });
+      });
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(outcome.result.safe, "value");
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(outcome.result, "customNested"),
+        false,
+      );
+    });
+
+    it("should not copy polluted inherited header buckets into nested headers", function () {
+      const outcome = withPollution(
+        {
+          common: { "x-polluted-common": "yes" },
+          get: { "x-polluted-get": "yes" },
+        },
+        function () {
+          return utils.merge(
+            {},
+            {
+              headers: {
+                common: {
+                  Accept: "application/json",
+                },
+                get: {
+                  "x-own-get": "yes",
+                },
+              },
+            },
+          );
+        },
+      );
+
+      assert.ifError(outcome.error);
+      const headers = outcome.result.headers;
+      assert.strictEqual(headers.common.Accept, "application/json");
+      assert.strictEqual(headers.get["x-own-get"], "yes");
+      assert.strictEqual(headers.common["x-polluted-common"], undefined);
+      assert.strictEqual(headers.get["x-polluted-get"], undefined);
+    });
+
+    it("should not merge a polluted Object.prototype.common into mergeConfig headers", function () {
+      const outcome = withPollution({ common: { "x-polluted-common": "yes" } }, function () {
+        return mergeConfig(
+          { headers: { common: { Accept: "application/json" } } },
+          { url: "/a" },
+        );
+      });
+
+      assert.ifError(outcome.error);
+      assert.strictEqual(outcome.result.headers.common.Accept, "application/json");
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(outcome.result.headers.common, "x-polluted-common"),
+        false,
+      );
+    });
+  });
+
+  // Axios.request flattens headers.common and headers[method] into the request.
+  // Those buckets were read through the prototype chain, so a polluted
+  // Object.prototype.common / Object.prototype.<method> injected headers.
+  describe("Axios.request header bucket flattening", function () {
+    function captureAdapter(store) {
+      return function (config) {
+        cleanup();
+        store.headers = config.headers;
+        return okResponse(config);
+      };
+    }
+
+    it("should not send headers from a polluted Object.prototype.common bucket", async function () {
+      const store = {};
+      const instance = axios.create({ adapter: captureAdapter(store) });
+      // Make sure the merged headers carry no own `common` bucket.
+      delete instance.defaults.headers.common;
+
+      let request;
+      const outcome = withPollution({ common: { "X-Polluted-Common": "yes" } }, function () {
+        request = instance.get("http://stub.invalid/", {
+          headers: { "X-Request": "request" },
+        });
+      });
+
+      assert.ifError(outcome.error);
+      await request;
+      assert.ok(store.headers, "adapter was not invoked");
+      assert.strictEqual(store.headers.get("X-Request"), "request");
+      assert.strictEqual(store.headers.get("X-Polluted-Common"), undefined);
+    });
+
+    it("should not send headers from a polluted Object.prototype.<method> bucket", async function () {
+      const store = {};
+      const instance = axios.create({ adapter: captureAdapter(store) });
+
+      let request;
+      const outcome = withPollution({ options: { "X-Polluted-Options": "yes" } }, function () {
+        // The default config has no own `options` bucket, so a request with
+        // method OPTIONS would read Object.prototype.options.
+        request = instance.request({
+          url: "http://stub.invalid/",
+          method: "options",
+          headers: { "X-Request": "request" },
+        });
+      });
+
+      assert.ifError(outcome.error);
+      await request;
+      assert.ok(store.headers, "adapter was not invoked");
+      assert.strictEqual(store.headers.get("X-Request"), "request");
+      assert.strictEqual(store.headers.get("X-Polluted-Options"), undefined);
+    });
+
+    it("should still send headers from own common and method buckets", async function () {
+      const store = {};
+      const instance = axios.create({
+        adapter: captureAdapter(store),
+        headers: {
+          common: { "X-Own-Common": "c" },
+          get: { "X-Own-Get": "g" },
+        },
+      });
+
+      await instance.get("http://stub.invalid/");
+
+      assert.strictEqual(store.headers.get("X-Own-Common"), "c");
+      assert.strictEqual(store.headers.get("X-Own-Get"), "g");
+    });
+  });
+
+  // End-to-end through the http adapter with a stub transport (no sockets are
+  // opened while Object.prototype is polluted). setProxy must only honor own
+  // proxy fields.
+  describe("http adapter proxy configuration", function () {
+    function stubTransport(store) {
+      return {
+        request(options, handleResponse) {
+          // setProxy has already run synchronously by the time the transport is
+          // invoked; clear the pollution before any further Node internals run.
+          cleanup();
+          store.options = {
+            hostname: options.hostname,
+            host: options.host,
+            port: options.port,
+            protocol: options.protocol,
+            path: options.path,
+            headers: Object.assign({}, options.headers),
+          };
+
+          const req = new EventEmitter();
+          req.write = function () {
+            return true;
+          };
+          req.setTimeout = function () {};
+          req.destroy = function () {};
+          req.end = function () {
+            const res = new stream.Readable({ read() {} });
+            res.statusCode = 200;
+            res.statusMessage = "OK";
+            res.headers = {};
+            res.rawHeaders = [];
+            res.req = req;
+            process.nextTick(function () {
+              handleResponse(res);
+              res.push(null);
+            });
+          };
+          return req;
+        },
+      };
+    }
+
+    function proxiedGet(store, pollution, proxy) {
+      // A fresh instance has no interceptors, so dispatch (and setProxy) runs
+      // synchronously inside the polluted window.
+      const instance = axios.create();
+      let request;
+      const outcome = withPollution(pollution, function () {
+        request = instance.get("http://stub.invalid/resource", {
+          proxy: proxy,
+          transport: stubTransport(store),
+          maxRedirects: 0,
+        });
+      });
+
+      assert.ifError(outcome.error);
+      return request;
+    }
+
+    it("should not inject Proxy-Authorization from a polluted Object.prototype.auth", async function () {
+      const store = {};
+
+      await proxiedGet(
+        store,
+        { auth: { username: "attacker", password: "exfil" } },
+        { host: "127.0.0.1", port: 8030, protocol: "http" },
+      );
+
+      assert.ok(store.options, "transport was not invoked");
+      assert.strictEqual(store.options.hostname, "127.0.0.1");
+      assert.strictEqual(store.options.headers["Proxy-Authorization"], undefined);
+    });
+
+    it("should not inject Proxy-Authorization from polluted Object.prototype.username and password", async function () {
+      const store = {};
+
+      await proxiedGet(
+        store,
+        { username: "attacker", password: "exfil" },
+        { host: "127.0.0.1", port: 8030, protocol: "http" },
+      );
+
+      assert.ok(store.options, "transport was not invoked");
+      assert.strictEqual(store.options.headers["Proxy-Authorization"], undefined);
+    });
+
+    it("should not route the proxied request to a polluted Object.prototype.hostname", async function () {
+      const store = {};
+
+      await proxiedGet(
+        store,
+        { hostname: "attacker.example.com", protocol: "https" },
+        { host: "127.0.0.1", port: 8030 },
+      );
+
+      assert.ok(store.options, "transport was not invoked");
+      assert.strictEqual(store.options.hostname, "127.0.0.1");
+      assert.strictEqual(store.options.host, "127.0.0.1");
+      assert.strictEqual(store.options.port, 8030);
+      assert.strictEqual(store.options.protocol, "http:");
+    });
+
+    it("should not complete own proxy auth with a polluted Object.prototype.password", async function () {
+      const store = {};
+
+      await proxiedGet(
+        store,
+        { password: "exfil" },
+        { host: "127.0.0.1", port: 8030, auth: { username: "user" } },
+      );
+
+      assert.ok(store.options, "transport was not invoked");
+      assert.strictEqual(
+        store.options.headers["Proxy-Authorization"],
+        "Basic " + Buffer.from("user:", "utf8").toString("base64"),
+      );
+    });
+
+    it("should still send own proxy credentials", async function () {
+      const store = {};
+
+      await proxiedGet(
+        store,
+        {},
+        { host: "127.0.0.1", port: 8030, auth: { username: "user", password: "pass" } },
+      );
+
+      assert.ok(store.options, "transport was not invoked");
+      assert.strictEqual(store.options.hostname, "127.0.0.1");
+      assert.strictEqual(
+        store.options.headers["Proxy-Authorization"],
+        "Basic " + Buffer.from("user:pass", "utf8").toString("base64"),
+      );
+    });
+  });
+});
