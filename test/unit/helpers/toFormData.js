@@ -5,6 +5,75 @@ import AxiosURLSearchParams from '../../../lib/helpers/AxiosURLSearchParams.js';
 import FormData from 'form-data';
 
 describe('helpers::toFormData', function () {
+  const createFormDataSpy = () => {
+    const calls = [];
+
+    return {
+      calls,
+      append(key, value) {
+        calls.push([key, value]);
+      },
+    };
+  };
+
+  describe('prototype pollution', function () {
+    afterEach(function () {
+      delete Object.prototype.visitor;
+      delete Object.prototype.maxDepth;
+    });
+
+    it('should ignore a visitor inherited only from Object.prototype', function () {
+      let called = false;
+      Object.prototype.visitor = () => {
+        called = true;
+        return false;
+      };
+
+      const formData = createFormDataSpy();
+      toFormData({ field: 'value' }, formData);
+
+      assert.strictEqual(called, false);
+      assert.deepStrictEqual(formData.calls, [['field', 'value']]);
+    });
+
+    it('should ignore maxDepth inherited only from Object.prototype', function () {
+      Object.prototype.maxDepth = 0;
+
+      const formData = createFormDataSpy();
+      assert.doesNotThrow(() => toFormData({ nested: { field: 'value' } }, formData));
+      assert.deepStrictEqual(formData.calls, [['nested[field]', 'value']]);
+    });
+
+    it('should ignore a visitor inherited from Object.prototype for params serialization', function () {
+      let called = false;
+      Object.prototype.visitor = () => {
+        called = true;
+        return false;
+      };
+
+      const params = new AxiosURLSearchParams({ field: 'value' });
+
+      assert.strictEqual(called, false);
+      assert.strictEqual(params.toString(), 'field=value');
+    });
+
+    it('should still honor own options', function () {
+      const visited = [];
+      const formData = createFormDataSpy();
+
+      toFormData({ nested: { field: 'value' } }, formData, {
+        dots: true,
+        visitor(value, key, path, helpers) {
+          visited.push(key);
+          return helpers.defaultVisitor.call(this, value, key, path, helpers);
+        },
+      });
+
+      assert.deepStrictEqual(visited, ['nested', 'field']);
+      assert.deepStrictEqual(formData.calls, [['nested.field', 'value']]);
+    });
+  });
+
   // --- Depth limit tests ---
 
   function nest(depth) {
