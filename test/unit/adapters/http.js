@@ -176,7 +176,7 @@ describe('supports http with nodejs', function () {
     assert.strictEqual(data.injected, null);
   });
 
-  it('should sanitize CRLF header values picked up from a polluted Object.prototype', async function () {
+  it('should not send CRLF header values from a polluted Object.prototype', async function () {
     server = await startHTTPServer((req, res) => {
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({
@@ -200,7 +200,9 @@ describe('supports http with nodejs', function () {
 
     const {data} = await request;
 
-    assert.strictEqual(data.amzTarget, 'dummyPUT /latest/api/token HTTP/1.1Injected: yes');
+    // The merged config has a null prototype (GHSA-q8qp-cvcw-x6jj), so the
+    // polluted headers are no longer picked up at all and nothing is injected.
+    assert.strictEqual(data.amzTarget, undefined);
     assert.strictEqual(data.injected, null);
   });
 
