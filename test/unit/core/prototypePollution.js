@@ -983,3 +983,255 @@ describe("GHSA-7q8q-rj6j-mhjq / GHSA-mmx7-hfxf-jppx nested option and config gad
     });
   });
 });
+
+describe("GHSA-3w6x-2g7m-8v23 default transform config gadgets", function () {
+  const pollutedKeys = [
+    "responseType",
+    "transitional",
+    "formSerializer",
+    "env",
+    "response",
+    "parseReviver",
+  ];
+
+  const transformRequest = defaults.transformRequest[0];
+  const transformResponse = defaults.transformResponse[0];
+
+  function pollute(key, value) {
+    Object.defineProperty(Object.prototype, key, {
+      value: value,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  function cleanup() {
+    pollutedKeys.forEach(function (key) {
+      delete Object.prototype[key];
+    });
+  }
+
+  function responseAdapter(body, onConfig) {
+    return function (config) {
+      if (onConfig) {
+        onConfig(config);
+      }
+
+      return Promise.resolve({
+        data: body,
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/json" },
+        config: config,
+        request: {},
+      });
+    };
+  }
+
+  afterEach(cleanup);
+
+  describe("transformResponse", function () {
+    it("should ignore an inherited responseType when parsing JSON responses", async function () {
+      pollute("responseType", "text");
+
+      const response = await axios.get("http://stub.invalid/api/me", {
+        adapter: responseAdapter('{"role":"viewer","isAdmin":false}'),
+      });
+
+      assert.strictEqual(typeof response.data, "object");
+      assert.strictEqual(response.data.role, "viewer");
+      assert.strictEqual(response.data.isAdmin, false);
+    });
+
+    it("should ignore an inherited responseType in the default transform", function () {
+      pollute("responseType", "text");
+
+      const result = transformResponse.call(
+        { transitional: defaults.transitional },
+        '{"isAdmin":false}',
+      );
+
+      assert.deepStrictEqual(result, { isAdmin: false });
+    });
+
+    it("should still honor an own responseType", function () {
+      const result = transformResponse.call(
+        { transitional: defaults.transitional, responseType: "text" },
+        '{"isAdmin":false}',
+      );
+
+      assert.strictEqual(result, '{"isAdmin":false}');
+    });
+
+    it("should ignore inherited transitional options", function () {
+      pollute("transitional", {
+        silentJSONParsing: true,
+        forcedJSONParsing: false,
+        clarifyTimeoutError: false,
+      });
+
+      const result = transformResponse.call({}, '{"isAdmin":false}');
+
+      assert.deepStrictEqual(result, { isAdmin: false });
+    });
+
+    it("should not turn on strict JSON parsing through inherited transitional options", function () {
+      pollute("transitional", {
+        silentJSONParsing: false,
+        forcedJSONParsing: true,
+        clarifyTimeoutError: false,
+      });
+
+      const result = transformResponse.call({ responseType: "json" }, "<html>not json</html>");
+
+      assert.strictEqual(result, "<html>not json</html>");
+    });
+
+    it("should not attach an inherited response object to JSON parse errors", function () {
+      const forged = { status: 200, data: { forged: true } };
+      pollute("response", forged);
+
+      assert.throws(
+        function () {
+          transformResponse.call(
+            {
+              responseType: "json",
+              transitional: {
+                silentJSONParsing: false,
+                forcedJSONParsing: true,
+                clarifyTimeoutError: false,
+              },
+            },
+            "{not json",
+          );
+        },
+        function (err) {
+          assert.strictEqual(err.code, "ERR_BAD_RESPONSE");
+          assert.strictEqual(Object.prototype.hasOwnProperty.call(err, "response"), false);
+          return true;
+        },
+      );
+    });
+
+    it("should not run an inherited parseReviver on JSON responses", async function () {
+      let reviverCalled = false;
+      pollute("parseReviver", function (key, value) {
+        reviverCalled = true;
+        if (key === "isAdmin") return true;
+        if (key === "role") return "admin";
+        return value;
+      });
+
+      const response = await axios.get("http://stub.invalid/api/me", {
+        adapter: responseAdapter('{"role":"viewer","isAdmin":false}'),
+      });
+
+      assert.strictEqual(reviverCalled, false);
+      assert.strictEqual(response.data.role, "viewer");
+      assert.strictEqual(response.data.isAdmin, false);
+    });
+  });
+
+  describe("transformRequest", function () {
+    function tamperingSerializer() {
+      return {
+        visitor: function (value, key, path, helpers) {
+          if (key === "role") {
+            this.append("role", "admin");
+            return false;
+          }
+          return helpers.defaultVisitor.apply(this, arguments);
+        },
+      };
+    }
+
+    it("should ignore an inherited formSerializer for urlencoded requests", async function () {
+      let sentData;
+      pollute("formSerializer", tamperingSerializer());
+
+      await axios.post(
+        "http://stub.invalid/",
+        { role: "viewer" },
+        {
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          adapter: responseAdapter(null, function (config) {
+            sentData = config.data;
+          }),
+        },
+      );
+
+      assert.strictEqual(sentData, "role=viewer");
+    });
+
+    it("should ignore an inherited formSerializer in the default transform", function () {
+      pollute("formSerializer", tamperingSerializer());
+
+      const result = transformRequest.call(
+        {},
+        { role: "viewer" },
+        new AxiosHeaders({ "Content-Type": "application/x-www-form-urlencoded" }),
+      );
+
+      assert.strictEqual(result, "role=viewer");
+    });
+
+    it("should still honor an own formSerializer", async function () {
+      let sentData;
+
+      await axios.post(
+        "http://stub.invalid/",
+        { role: "viewer" },
+        {
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          formSerializer: tamperingSerializer(),
+          adapter: responseAdapter(null, function (config) {
+            sentData = config.data;
+          }),
+        },
+      );
+
+      assert.strictEqual(sentData, "role=admin");
+    });
+
+    it("should ignore an inherited env.FormData for multipart requests", function () {
+      let constructed = false;
+
+      function EvilFormData() {
+        constructed = true;
+        this.entries = [];
+      }
+      EvilFormData.prototype.append = function (key, value) {
+        this.entries.push([key, value]);
+      };
+
+      pollute("env", { FormData: EvilFormData });
+
+      const result = transformRequest.call(
+        {},
+        { role: "viewer" },
+        new AxiosHeaders({ "Content-Type": "multipart/form-data" }),
+      );
+
+      assert.strictEqual(constructed, false);
+      assert.ok(!(result instanceof EvilFormData));
+    });
+
+    it("should still honor an own env.FormData", function () {
+      function OwnFormData() {
+        this.entries = [];
+      }
+      OwnFormData.prototype.append = function (key, value) {
+        this.entries.push([key, value]);
+      };
+
+      const result = transformRequest.call(
+        { env: { FormData: OwnFormData } },
+        { role: "viewer" },
+        new AxiosHeaders({ "Content-Type": "multipart/form-data" }),
+      );
+
+      assert.ok(result instanceof OwnFormData);
+      assert.deepStrictEqual(result.entries, [["role", "viewer"]]);
+    });
+  });
+});
