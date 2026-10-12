@@ -136,6 +136,20 @@ describe('instance', function () {
     expect(instance.getUri(options)).toBe('https://api.example.com/foo/bar?name=axios');
   });
 
+  it('should combine baseURL and an absolute url in getUri if allowAbsoluteUrls is false', function() {
+    const instance = axios.create({
+      baseURL: 'https://api.example.com',
+      allowAbsoluteUrls: false
+    });
+    const options = {
+      url: 'https://evil.example.org/foo',
+      params: {
+        name: 'axios'
+      }
+    };
+    expect(instance.getUri(options)).toBe('https://api.example.com/https://evil.example.org/foo?name=axios');
+  });
+
   it('should correctly build url without baseURL', function () {
     const instance = axios.create();
     const options = {

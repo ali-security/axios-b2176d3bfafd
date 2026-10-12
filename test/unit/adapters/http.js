@@ -1407,6 +1407,57 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should combine baseURL and an absolute url if allowAbsoluteUrls is false', async function () {
+    let isOtherHostRequested = false;
+
+    const otherServer = await startHTTPServer((req, res) => {
+      isOtherHostRequested = true;
+      res.end('other');
+    }, {port: 4445});
+
+    try {
+      server = await startHTTPServer((req, res) => res.end(req.url), {port: 4444});
+
+      const instance = axios.create({
+        baseURL: LOCAL_SERVER_URL + '/',
+        allowAbsoluteUrls: false
+      });
+
+      const {data, config} = await instance.get('http://localhost:4445/foo');
+
+      assert.strictEqual(config.allowAbsoluteUrls, false);
+      assert.strictEqual(data, '/http://localhost:4445/foo');
+      assert.strictEqual(isOtherHostRequested, false);
+
+      const {data: requestData} = await axios.get('http://localhost:4445/bar', {
+        baseURL: LOCAL_SERVER_URL + '/',
+        allowAbsoluteUrls: false
+      });
+
+      assert.strictEqual(requestData, '/http://localhost:4445/bar');
+      assert.strictEqual(isOtherHostRequested, false);
+    } finally {
+      await stopHTTPServer(otherServer);
+    }
+  });
+
+  it('should use an absolute url over baseURL if allowAbsoluteUrls is not set', async function () {
+    const otherServer = await startHTTPServer((req, res) => res.end('other' + req.url), {port: 4445});
+
+    try {
+      server = await startHTTPServer((req, res) => res.end(req.url), {port: 4444});
+
+      const {data, config} = await axios.get('http://localhost:4445/foo', {
+        baseURL: LOCAL_SERVER_URL + '/'
+      });
+
+      assert.strictEqual(config.allowAbsoluteUrls, true);
+      assert.strictEqual(data, 'other/foo');
+    } finally {
+      await stopHTTPServer(otherServer);
+    }
+  });
+
   it('should support HTTP protocol', function (done) {
     server = http.createServer(function (req, res) {
       setTimeout(function () {
