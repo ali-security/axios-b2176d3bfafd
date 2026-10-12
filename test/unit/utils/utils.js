@@ -53,6 +53,41 @@ describe('utils', function (){
       }
       assert.equal(utils.isFormData(new FormData()), true);
     });
+
+    describe('prototype pollution (GHSA-6chq-wfr3-2hj9)', () => {
+      const originalToString = Object.getOwnPropertyDescriptor(Object.prototype, 'toString');
+
+      afterEach(() => {
+        delete Object.prototype.append;
+        delete Object.prototype[Symbol.toStringTag];
+        Object.defineProperty(Object.prototype, 'toString', originalToString);
+      });
+
+      it('should not treat a plain object as FormData when Object.prototype carries append and toStringTag', () => {
+        Object.prototype.append = () => {};
+        Object.prototype[Symbol.toStringTag] = 'FormData';
+
+        assert.strictEqual(utils.isFormData({userId: 42}), false);
+      });
+
+      it('should not treat a plain object as FormData when Object.prototype carries append and toString', () => {
+        Object.prototype.append = () => {};
+        Object.prototype.toString = () => '[object FormData]';
+
+        const result = utils.isFormData({userId: 42});
+
+        Object.defineProperty(Object.prototype, 'toString', originalToString);
+
+        assert.strictEqual(result, false);
+      });
+
+      it('should still detect genuine FormData instances while Object.prototype is polluted', () => {
+        Object.prototype.append = () => {};
+        Object.prototype[Symbol.toStringTag] = 'FormData';
+
+        assert.strictEqual(utils.isFormData(new FormData()), true);
+      });
+    });
   });
 
   describe('toJSON', function (){
