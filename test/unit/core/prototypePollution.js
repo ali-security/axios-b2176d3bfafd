@@ -51,6 +51,9 @@ describe("Prototype Pollution Protection", function () {
     delete Object.prototype.transformResponse;
     delete Object.prototype.config;
     delete Object.prototype.customOpt;
+    delete Object.prototype.transport;
+    delete Object.prototype.formSerializer;
+    delete Object.prototype.parseReviver;
   });
 
   describe("utils.merge", function () {
@@ -231,6 +234,43 @@ describe("Prototype Pollution Protection", function () {
       assert.strictEqual(Object.prototype.polluted, undefined);
       assert.strictEqual(result.customProp.safe, "value");
       assert.strictEqual(result.customProp.hasOwnProperty("__proto__"), false);
+    });
+
+    it("should not inherit transport from Object.prototype", function () {
+      Object.prototype.transport = { request: function () {} };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(result.hasOwnProperty("transport"), false);
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transport"),
+        false
+      );
+    });
+
+    it("should not inherit transformRequest from Object.prototype", function () {
+      Object.prototype.transformRequest = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformRequest"),
+        false
+      );
+    });
+
+    it("should not inherit transformResponse from Object.prototype", function () {
+      Object.prototype.transformResponse = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformResponse"),
+        false
+      );
+    });
+
+    it("should not inherit arbitrary keys from Object.prototype", function () {
+      Object.prototype.polluted = "yes";
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "polluted"),
+        false
+      );
     });
 
     it("should still merge configs correctly", function () {
@@ -1901,6 +1941,260 @@ describe("GHSA-3w6x-2g7m-8v23 default transform config gadgets", function () {
 
       assert.ok(result instanceof OwnFormData);
       assert.deepStrictEqual(result.entries, [["role", "viewer"]]);
+    });
+  });
+});
+
+// CVE-2026-44495: mergeConfig read config1[prop] / config2[prop] directly, so a
+// key that is own on one config but missing from the other was resolved through
+// a polluted Object.prototype. The http adapter likewise read config.env.Blob
+// without an own-property check when decoding data: URIs.
+describe("CVE-2026-44495 mergeConfig and http adapter own-property reads", function () {
+  const pollutedKeys = [
+    "transformRequest",
+    "transformResponse",
+    "adapter",
+    "transport",
+    "headers",
+    "baseURL",
+    "params",
+    "env",
+  ];
+
+  function pollute(key, value) {
+    Object.defineProperty(Object.prototype, key, {
+      value: value,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  function cleanup() {
+    pollutedKeys.forEach(function (key) {
+      delete Object.prototype[key];
+    });
+  }
+
+  afterEach(cleanup);
+
+  describe("mergeConfig", function () {
+    it("should not let a polluted transformRequest replace an own config1 value", function () {
+      const ownTransform = function ownTransform(data) {
+        return data;
+      };
+      pollute("transformRequest", function polluted() {
+        return "hijacked";
+      });
+
+      const result = mergeConfig({ transformRequest: [ownTransform] }, { url: "/a" });
+
+      assert.ok(Array.isArray(result.transformRequest));
+      assert.strictEqual(result.transformRequest.length, 1);
+      assert.strictEqual(result.transformRequest[0], ownTransform);
+    });
+
+    it("should not let a polluted transformResponse replace an own config1 value", function () {
+      const ownTransform = function ownTransform(data) {
+        return data;
+      };
+      pollute("transformResponse", function polluted() {
+        return "hijacked";
+      });
+
+      const result = mergeConfig({ transformResponse: [ownTransform] }, { url: "/a" });
+
+      assert.ok(Array.isArray(result.transformResponse));
+      assert.strictEqual(result.transformResponse.length, 1);
+      assert.strictEqual(result.transformResponse[0], ownTransform);
+    });
+
+    it("should not let a polluted adapter replace the default adapter", function () {
+      pollute("adapter", function pollutedAdapter() {
+        return Promise.resolve({ data: "forged", status: 200 });
+      });
+
+      const result = mergeConfig(defaults, { url: "/a" });
+
+      assert.deepStrictEqual(result.adapter, defaults.adapter);
+    });
+
+    it("should not let a polluted transport replace an own config1 value", function () {
+      const ownTransport = { request: function ownRequest() {} };
+      pollute("transport", { request: function pollutedRequest() {} });
+
+      const result = mergeConfig({ transport: ownTransport }, { url: "/a" });
+
+      assert.strictEqual(result.transport.request, ownTransport.request);
+    });
+
+    it("should not let a polluted baseURL replace an own config1 value", function () {
+      pollute("baseURL", "https://attacker.example");
+
+      const result = mergeConfig({ baseURL: "https://api.example.com" }, { url: "/users" });
+
+      assert.strictEqual(result.baseURL, "https://api.example.com");
+    });
+
+    it("should not merge polluted headers into own config1 headers", function () {
+      pollute("headers", { "X-Injected": "evil" });
+
+      const result = mergeConfig(
+        { headers: { common: { Accept: "application/json" } } },
+        { url: "/a" },
+      );
+
+      assert.strictEqual(result.headers.common.Accept, "application/json");
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result.headers, "X-Injected"),
+        false,
+      );
+    });
+
+    it("should not merge a polluted config1 value into an own config2 object", function () {
+      pollute("params", { injected: "evil" });
+
+      const result = mergeConfig({}, { params: { q: "1" } });
+
+      assert.deepStrictEqual(Object.keys(result.params), ["q"]);
+      assert.strictEqual(result.params.q, "1");
+    });
+
+    it("should still prefer own config2 values over own config1 values", function () {
+      const first = function first(data) {
+        return data;
+      };
+      const second = function second(data) {
+        return data;
+      };
+      pollute("transformRequest", function polluted() {
+        return "hijacked";
+      });
+
+      const result = mergeConfig(
+        { transformRequest: [first], baseURL: "https://one.example" },
+        { transformRequest: [second], url: "/a" },
+      );
+
+      assert.deepStrictEqual(result.transformRequest, [second]);
+      assert.strictEqual(result.baseURL, "https://one.example");
+      assert.strictEqual(result.url, "/a");
+    });
+  });
+
+  describe("axios.request", function () {
+    it("should not run a polluted transformRequest for a plain request config", async function () {
+      let invoked = false;
+      let sentData;
+
+      pollute("transformRequest", function polluted() {
+        invoked = true;
+        return "INJECTED";
+      });
+
+      await axios.request({
+        url: "http://stub.invalid/",
+        method: "post",
+        data: { hello: "world" },
+        adapter: function (config) {
+          sentData = config.data;
+          return Promise.resolve({
+            data: null,
+            status: 200,
+            statusText: "OK",
+            headers: {},
+            config: config,
+            request: {},
+          });
+        },
+      });
+
+      assert.strictEqual(invoked, false);
+      assert.strictEqual(sentData, JSON.stringify({ hello: "world" }));
+    });
+
+    it("should not dispatch through a polluted adapter for a plain request config", async function () {
+      let invoked = false;
+
+      pollute("adapter", function pollutedAdapter(config) {
+        invoked = true;
+        return Promise.resolve({
+          data: "forged",
+          status: 200,
+          statusText: "OK",
+          headers: {},
+          config: config,
+          request: {},
+        });
+      });
+
+      const response = await axios.request({
+        url: "data:text/plain;base64," + Buffer.from("genuine").toString("base64"),
+        responseType: "text",
+      });
+
+      assert.strictEqual(invoked, false);
+      assert.strictEqual(response.data, "genuine");
+    });
+  });
+
+  describe("http adapter", function () {
+    function dataURIConfig(extra) {
+      return Object.assign(
+        {
+          method: "get",
+          url: "data:application/octet-stream;base64," + Buffer.from("123").toString("base64"),
+          headers: {},
+          responseType: "blob",
+          maxContentLength: -1,
+          maxBodyLength: -1,
+          timeout: 0,
+        },
+        extra || {},
+      );
+    }
+
+    it("should ignore a polluted env.Blob when decoding a data: URI as a blob", async function () {
+      let constructed = false;
+
+      function EvilBlob() {
+        constructed = true;
+      }
+
+      pollute("env", { Blob: EvilBlob });
+
+      let response;
+      let error;
+
+      try {
+        response = await httpAdapter(dataURIConfig());
+      } catch (err) {
+        error = err;
+      }
+
+      assert.strictEqual(constructed, false);
+      assert.ok(!(response && response.data instanceof EvilBlob));
+
+      if (typeof Blob !== "undefined") {
+        assert.ok(!error, error && error.message);
+        assert.ok(response.data instanceof Blob);
+        assert.strictEqual(response.data.type, "application/octet-stream");
+      } else {
+        // No native Blob: the adapter must refuse instead of using the polluted class.
+        assert.ok(error);
+      }
+    });
+
+    it("should still honor an own env.Blob when decoding a data: URI as a blob", async function () {
+      function OwnBlob(parts, options) {
+        this.parts = parts;
+        this.type = options.type;
+      }
+
+      const response = await httpAdapter(dataURIConfig({ env: { Blob: OwnBlob } }));
+
+      assert.ok(response.data instanceof OwnBlob);
+      assert.strictEqual(response.data.type, "application/octet-stream");
+      assert.strictEqual(Buffer.concat(response.data.parts).toString(), "123");
     });
   });
 });
