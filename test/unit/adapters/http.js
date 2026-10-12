@@ -155,6 +155,53 @@ describe('supports http with nodejs', function () {
     delete process.env.no_proxy;
   });
 
+  it('should sanitize request headers containing CRLF characters', async function () {
+    server = await startHTTPServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        xTest: req.headers['x-test'],
+        injected: req.headers.injected === undefined ? null : req.headers.injected
+      }));
+    }, {port: 4444});
+
+    const {data} = await axios.get(LOCAL_SERVER_URL, {
+      headers: {
+        'x-test': '\tok\r\nInjected: yes '
+      }
+    });
+
+    assert.strictEqual(data.xTest, 'okInjected: yes');
+    assert.strictEqual(data.injected, null);
+  });
+
+  it('should sanitize CRLF header values picked up from a polluted Object.prototype', async function () {
+    server = await startHTTPServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        amzTarget: req.headers['x-amz-target'],
+        injected: req.headers.injected === undefined ? null : req.headers.injected
+      }));
+    }, {port: 4444});
+
+    let request;
+
+    // simulate a prototype pollution gadget chain: config.headers is resolved via the prototype chain
+    Object.prototype.headers = {
+      'x-amz-target': 'dummy\r\n\r\nPUT /latest/api/token HTTP/1.1\r\nInjected: yes'
+    };
+
+    try {
+      request = axios.get(LOCAL_SERVER_URL);
+    } finally {
+      delete Object.prototype.headers;
+    }
+
+    const {data} = await request;
+
+    assert.strictEqual(data.amzTarget, 'dummyPUT /latest/api/token HTTP/1.1Injected: yes');
+    assert.strictEqual(data.injected, null);
+  });
+
   it('should throw an error if the timeout property is not parsable as a number', function (done) {
 
     server = http.createServer(function (req, res) {
